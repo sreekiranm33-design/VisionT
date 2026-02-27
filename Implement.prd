@@ -1,0 +1,321 @@
+## Complete Project Brief: SteelViT — Surface Defect Classification
+
+---
+
+### Environment Setup: `uv` Python Virtual Environment
+
+**Install uv** (if not already):
+```powershell
+pip install uv
+```
+
+**Create and activate the project environment:**
+```powershell
+cd E:\VisionT
+uv venv .venv --python 3.11
+.venv\Scripts\activate
+```
+
+**Install dependencies via uv:**
+```powershell
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+uv pip install timm scikit-learn matplotlib seaborn pandas tqdm tensorboard
+```
+
+**Save lockfile:**
+```powershell
+uv pip freeze > requirements.txt
+```
+
+> The coding agent should always run inside this venv. All scripts should be executed as `python train.py` after activating `.venv\Scripts\activate`.
+
+---
+
+### Project Directory Structure
+
+```
+E:\VisionT\
+├── .venv\                    # uv virtual environment (do not touch)
+├── NEU-CLS-64\               # existing dataset
+│   ├── cr\
+│   ├── gg\
+│   ├── in\
+│   ├── pa\
+│   ├── ps\
+│   ├── rp\
+│   ├── rs\
+│   ├── sc\
+│   └── sp\
+├── runs\                     # auto-created, TensorBoard logs
+├── checkpoints\              # auto-created, saved model weights
+├── config.py
+├── dataset.py
+├── model.py
+├── train.py
+├── evaluate.py
+├── utils.py
+└── requirements.txt
+```
+
+---
+
+### Dataset
+
+- **Name:** NEU-CLS-64
+- **Classes (9):** `cr`, `gg`, `in`, `pa`, `ps`, `rp`, `rs`, `sc`, `sp`
+- **Image format:** `.jpg`, grayscale, 64×64 pixels
+- **Structure:** One folder per class, flat image files inside (no subfolders)
+- **Split:** Stratified 80% train / 10% val / 10% test — done at runtime in `dataset.py`, no manual folder reorganization needed
+- **No separate annotation files** — class label is inferred from folder name
+
+---
+
+### config.py — Full Specification
+
+```python
+# config.py
+
+# Paths
+DATA_DIR       = r"E:\VisionT\NEU-CLS-64"
+CHECKPOINT_DIR = r"E:\VisionT\checkpoints"
+LOG_DIR        = r"E:\VisionT\runs"
+
+# Dataset
+NUM_CLASSES    = 9
+IMAGE_SIZE     = 64
+IN_CHANNELS    = 1          # grayscale
+TRAIN_SPLIT    = 0.8
+VAL_SPLIT      = 0.1
+TEST_SPLIT     = 0.1
+RANDOM_SEED    = 42
+
+# Model
+EMBED_DIM      = 192
+NUM_HEADS      = 3          # head_dim = 64
+DEPTH          = 6          # transformer layers
+MLP_RATIO      = 4.0
+PATCH_SIZE     = 2          # applied after CNN stem → 8×8 token grid
+DROP_PATH_RATE = 0.1        # stochastic depth max rate
+LAYER_SCALE_INIT = 1e-4
+
+# Training
+BATCH_SIZE     = 64
+NUM_EPOCHS     = 200
+NUM_WORKERS    = 4
+
+# Optimizer (AdamW)
+LR             = 1e-3
+WEIGHT_DECAY   = 0.05
+BETAS          = (0.9, 0.999)
+
+# Scheduler
+WARMUP_EPOCHS  = 10
+
+# Regularization & Loss
+LABEL_SMOOTHING = 0.1
+MIXUP_ALPHA     = 0.2
+CUTMIX_ALPHA    = 1.0
+
+# Augmentation (RandAugment)
+RANDAUG_N      = 2
+RANDAUG_M      = 9
+
+# Normalization (grayscale)
+NORM_MEAN      = [0.5]
+NORM_STD       = [0.5]
+
+# Misc
+DEVICE         = "cuda"     # falls back to cpu if unavailable
+AMP            = True       # automatic mixed precision
+SAVE_EVERY     = 10         # save checkpoint every N epochs
+```
+
+---
+
+### Model Architecture: SteelViT (~3.36M Parameters)
+
+#### Overview
+A hybrid CNN-Transformer. The CNN stem extracts local texture features first (critical for defect patterns), then the Transformer encoder reasons globally over the resulting feature tokens. Pure ViT on 64×64 images is suboptimal — this design is motivated by CvT, MobileViT, and EfficientFormer.
+
+---
+
+#### model.py — Full Specification
+
+**Block 1: CNN Stem**
+```
+Input:  [B, 1, 64, 64]
+
+Conv2d(1  → 32,  kernel=3, stride=1, padding=1) → BatchNorm2d(32)  → GELU  # [B, 32, 64, 64]
+Conv2d(32 → 64,  kernel=3, stride=2, padding=1) → BatchNorm2d(64)  → GELU  # [B, 64, 32, 32]
+Conv2d(64 → 128, kernel=3, stride=2, padding=1) → BatchNorm2d(128) → GELU  # [B, 128,16, 16]
+```
+
+**Block 2: Patch Embedding**
+```
+Conv2d(128 → 192, kernel=2, stride=2)   # [B, 192, 8, 8]
+Flatten spatial dims → [B, 64, 192]     # 64 tokens, embed_dim=192
+Prepend CLS token   → [B, 65, 192]
+Add learnable positional embedding [1, 65, 192]
+```
+
+**Block 3: Transformer Encoder × 6**
+
+Each layer follows:
+```
+x = x + LayerScale(MHSA(LayerNorm(x)), init=1e-4)   # with StochasticDepth
+x = x + LayerScale(MLP(LayerNorm(x)),  init=1e-4)   # with StochasticDepth
+```
+
+Where:
+- **MHSA:** MultiHeadSelfAttention — 3 heads, head_dim=64, no attn dropout
+- **MLP:** Linear(192→768) → GELU → Linear(768→192)
+- **LayerScale:** per-channel scalar initialized to 1e-4, multiplied to output before residual add
+- **StochasticDepth:** linear schedule — layer `i` gets drop rate `i / (depth-1) * DROP_PATH_RATE`
+
+**Block 4: Classification Head**
+```
+CLS token → LayerNorm(192) → Linear(192 → 9)
+```
+
+**Weight Initialization:**
+- All Linear and Conv2d: `trunc_normal_(std=0.02)`
+- All biases: `zeros_`
+- BatchNorm: weight=1, bias=0
+
+**Parameter count target: ~3.36M**
+
+---
+
+### dataset.py — Full Specification
+
+- Use `torchvision.datasets.ImageFolder` with `root=DATA_DIR`
+- Convert images to grayscale (`transforms.Grayscale(1)`)
+- Perform stratified train/val/test split using `sklearn.model_selection.train_test_split` on the full index list
+- Wrap splits in `torch.utils.data.Subset`
+
+**Train transforms:**
+```
+Grayscale(1)
+Resize(64)
+RandomHorizontalFlip()
+RandomVerticalFlip()
+RandomRotation(15)
+RandAugment(n=RANDAUG_N, magnitude=RANDAUG_M)
+ToTensor()
+Normalize(NORM_MEAN, NORM_STD)
+```
+
+**Val/Test transforms:**
+```
+Grayscale(1)
+Resize(64)
+ToTensor()
+Normalize(NORM_MEAN, NORM_STD)
+```
+
+---
+
+### utils.py — Full Specification
+
+Implement the following utilities:
+
+1. **`get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs)`**
+   - Linear warmup from 0 → LR over `warmup_epochs`
+   - Cosine decay from LR → 0 over remaining epochs
+   - Use `torch.optim.lr_scheduler.LambdaLR`
+
+2. **`mixup_data(x, y, alpha)`**
+   - Sample `lam ~ Beta(alpha, alpha)`
+   - Shuffle batch, mix inputs and return `(mixed_x, y_a, y_b, lam)`
+
+3. **`cutmix_data(x, y, alpha)`**
+   - Sample `lam ~ Beta(alpha, alpha)`, compute box, cut and paste region
+   - Return `(mixed_x, y_a, y_b, lam)`
+
+4. **`mixup_cutmix_criterion(criterion, pred, y_a, y_b, lam)`**
+   - Returns `lam * criterion(pred, y_a) + (1-lam) * criterion(pred, y_b)`
+
+5. **`count_parameters(model)`**
+   - Returns total trainable parameter count, prints formatted summary
+
+---
+
+### train.py — Full Specification
+
+Training loop structure:
+
+```
+1. Parse/load config
+2. Set random seed (torch, numpy, random) for reproducibility
+3. Build datasets and dataloaders (dataset.py)
+4. Instantiate SteelViT (model.py)
+5. count_parameters() → log to console
+6. Loss: CrossEntropyLoss(label_smoothing=0.1)
+7. Optimizer: AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, betas=BETAS)
+8. Scheduler: get_cosine_schedule_with_warmup(...)
+9. AMP: torch.cuda.amp.GradScaler if AMP=True
+10. TensorBoard: SummaryWriter(LOG_DIR)
+
+Per epoch:
+  [Train]
+    - Randomly choose MixUp or CutMix (50/50) per batch
+    - AMP forward pass
+    - mixup_cutmix_criterion for loss
+    - Backward + optimizer step + scheduler step
+    - Log: loss, lr to TensorBoard
+
+  [Val]
+    - No augmentation, no mixup
+    - Standard CrossEntropy loss
+    - Compute: accuracy, macro F1 (sklearn)
+    - Log: val_loss, val_acc, val_f1 to TensorBoard
+
+  [Checkpoint]
+    - Save every SAVE_EVERY epochs to CHECKPOINT_DIR/epoch_{N}.pth
+    - Always save best model as CHECKPOINT_DIR/best.pth (based on val_f1)
+    - Checkpoint contains: epoch, model_state_dict, optimizer_state_dict, val_f1, val_acc
+```
+
+---
+
+### evaluate.py — Full Specification
+
+Load `best.pth` and run on the test split:
+
+```
+- Per-class accuracy
+- Macro F1, Precision, Recall (sklearn.metrics.classification_report)
+- Confusion matrix → saved as confusion_matrix.png (seaborn heatmap, class names on axes)
+- Top misclassified pairs highlighted
+- Print total test accuracy
+```
+
+---
+
+### Instructions for the Coding Agent
+
+1. **Start by creating the venv** using the `uv` commands above before writing any code
+2. **Implement files in this order:** `config.py` → `utils.py` → `model.py` → `dataset.py` → `train.py` → `evaluate.py`
+3. **Use `timm` library** for LayerScale and StochasticDepth — import as `from timm.layers import LayerScale, DropPath` — these are battle-tested implementations
+4. **Verify parameter count** after building the model — it should print ~3.36M; if significantly off, check embed_dim or MLP hidden dim
+5. **Test dataloader first** — before training, run a single batch through the model to confirm shapes are correct end-to-end: `[B, 1, 64, 64]` → `[B, 9]`
+6. **MixUp/CutMix** is applied in the training loop, not in the dataset/transforms
+7. **Do not use** `torch.nn.Transformer` — implement the encoder manually using the spec above for full control
+8. **AMP** — wrap forward pass in `torch.cuda.amp.autocast()`, use `GradScaler` for backward
+9. **TensorBoard** — launch with `tensorboard --logdir E:\VisionT\runs` to monitor training live
+10. **Class names** — extract from `dataset.classes` and pass to evaluate.py for the confusion matrix labels
+
+---
+
+### Quick Sanity Check the Agent Should Run First
+
+```python
+import torch
+from model import SteelViT
+from config import *
+
+model = SteelViT(num_classes=NUM_CLASSES)
+x = torch.randn(2, 1, 64, 64)
+out = model(x)
+print(out.shape)  # expected: torch.Size([2, 9])
+```

@@ -1,0 +1,30 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling cache
+.uv-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Project artifacts
+checkpoints/
+runs/
+plots/
+
+# Local dataset (do not commit)
+NEU-CLS-64/
+
