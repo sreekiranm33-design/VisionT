@@ -43,6 +43,9 @@ WARMUP_EPOCHS = 10
 LABEL_SMOOTHING = 0.1
 MIXUP_ALPHA = 0.2
 CUTMIX_ALPHA = 1.0
+USE_CLASS_WEIGHTED_LOSS = True
+USE_WEIGHTED_SAMPLER = False
+CLASS_WEIGHT_POWER = 0.5
 
 # Augmentation (RandAugment)
 RANDAUG_N = 2
@@ -56,3 +59,5 @@ NORM_STD = [0.5]
 DEVICE = "cuda"
 AMP = True
 SAVE_EVERY = 10
+EVAL_USE_TTA = True
+TTA_FLIPS = ("none", "hflip", "vflip", "hvflip")

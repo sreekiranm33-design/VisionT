@@ -21,6 +21,34 @@ def resolve_device():
     return torch.device("cpu")
 
 
+def apply_tta(images, mode):
+    if mode == "none":
+        return images
+    if mode == "hflip":
+        return torch.flip(images, dims=[3])
+    if mode == "vflip":
+        return torch.flip(images, dims=[2])
+    if mode == "hvflip":
+        return torch.flip(images, dims=[2, 3])
+    raise ValueError(f"Unsupported TTA mode: {mode}")
+
+
+def predict_with_tta(model, images, use_amp):
+    if not cfg.EVAL_USE_TTA:
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            logits = model(images)
+        return torch.softmax(logits, dim=1)
+
+    probs_sum = None
+    for mode in cfg.TTA_FLIPS:
+        aug_images = apply_tta(images, mode)
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            logits = model(aug_images)
+        probs = torch.softmax(logits, dim=1)
+        probs_sum = probs if probs_sum is None else (probs_sum + probs)
+    return probs_sum / len(cfg.TTA_FLIPS)
+
+
 def save_confusion_matrix(cm, class_names, output_path):
     plt.figure(figsize=(10, 8))
     sns.heatmap(
@@ -41,7 +69,8 @@ def save_confusion_matrix(cm, class_names, output_path):
 
 def save_normalized_confusion_matrix(cm, class_names, output_path):
     row_sums = cm.sum(axis=1, keepdims=True)
-    normalized_cm = np.divide(cm, row_sums, where=row_sums != 0)
+    normalized_cm = np.zeros_like(cm, dtype=float)
+    np.divide(cm, row_sums, out=normalized_cm, where=row_sums != 0)
     plt.figure(figsize=(10, 8))
     sns.heatmap(
         normalized_cm,
@@ -135,10 +164,8 @@ def main():
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                logits = model(images)
-
-            preds = logits.argmax(dim=1)
+            probs = predict_with_tta(model, images, use_amp=use_amp)
+            preds = probs.argmax(dim=1)
             all_targets.extend(labels.cpu().tolist())
             all_preds.extend(preds.cpu().tolist())
 
@@ -159,6 +186,7 @@ def main():
     )
 
     print(f"Total test accuracy: {accuracy:.4f}")
+    print(f"TTA enabled: {cfg.EVAL_USE_TTA} | modes: {list(cfg.TTA_FLIPS)}")
     print(
         f"Macro precision: {macro_precision:.4f} | "
         f"Macro recall: {macro_recall:.4f} | "

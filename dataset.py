@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torchvision import datasets, transforms
 
 import config as cfg
@@ -64,21 +64,50 @@ def build_datasets(data_dir=cfg.DATA_DIR, random_seed=cfg.RANDOM_SEED):
     val_dataset = Subset(eval_dataset_full, val_idx.tolist())
     test_dataset = Subset(eval_dataset_full, test_idx.tolist())
 
-    return train_dataset, val_dataset, test_dataset, base_dataset.classes
+    train_targets = targets[train_idx]
+    train_class_counts = np.bincount(train_targets, minlength=cfg.NUM_CLASSES)
+
+    metadata = {
+        "train_targets": train_targets.tolist(),
+        "train_class_counts": train_class_counts.tolist(),
+    }
+
+    return train_dataset, val_dataset, test_dataset, base_dataset.classes, metadata
 
 
 def create_dataloaders(
-    batch_size=cfg.BATCH_SIZE, num_workers=cfg.NUM_WORKERS, data_dir=cfg.DATA_DIR
+    batch_size=cfg.BATCH_SIZE,
+    num_workers=cfg.NUM_WORKERS,
+    data_dir=cfg.DATA_DIR,
+    return_metadata=False,
 ):
-    train_dataset, val_dataset, test_dataset, class_names = build_datasets(data_dir=data_dir)
+    train_dataset, val_dataset, test_dataset, class_names, metadata = build_datasets(
+        data_dir=data_dir
+    )
 
     pin_memory = torch.cuda.is_available()
     persistent_workers = num_workers > 0
+    sampler = None
+    shuffle = True
+
+    if cfg.USE_WEIGHTED_SAMPLER:
+        train_targets = np.array(metadata["train_targets"], dtype=np.int64)
+        class_counts = np.array(metadata["train_class_counts"], dtype=np.float64)
+        class_counts = np.maximum(class_counts, 1.0)
+        class_sampling_weights = 1.0 / class_counts
+        sample_weights = class_sampling_weights[train_targets]
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        shuffle = False
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
@@ -100,4 +129,6 @@ def create_dataloaders(
         persistent_workers=persistent_workers,
     )
 
+    if return_metadata:
+        return train_loader, val_loader, test_loader, class_names, metadata
     return train_loader, val_loader, test_loader, class_names

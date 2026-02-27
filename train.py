@@ -21,6 +21,14 @@ from utils import (
 )
 
 
+def compute_class_weights(class_counts, power=1.0):
+    counts = np.array(class_counts, dtype=np.float64)
+    counts = np.maximum(counts, 1.0)
+    inv = np.power(1.0 / counts, power)
+    weights = inv / np.mean(inv)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
 def set_random_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -65,7 +73,9 @@ def main():
     cfg.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    train_loader, val_loader, _, class_names = create_dataloaders()
+    train_loader, val_loader, _, class_names, metadata = create_dataloaders(
+        return_metadata=True
+    )
     device = resolve_device()
     use_amp = cfg.AMP and device.type == "cuda"
 
@@ -79,7 +89,18 @@ def main():
         sanity_logits = model(sanity_images[:2])
     print(f"Sanity check output shape: {tuple(sanity_logits.shape)}")
 
-    train_criterion = nn.CrossEntropyLoss(label_smoothing=cfg.LABEL_SMOOTHING)
+    class_weights = None
+    if cfg.USE_CLASS_WEIGHTED_LOSS:
+        class_weights = compute_class_weights(
+            metadata["train_class_counts"], power=cfg.CLASS_WEIGHT_POWER
+        ).to(device)
+        print(f"Train class counts: {metadata['train_class_counts']}")
+        print(f"Loss class weights: {[round(v, 4) for v in class_weights.tolist()]}")
+
+    train_criterion = nn.CrossEntropyLoss(
+        label_smoothing=cfg.LABEL_SMOOTHING,
+        weight=class_weights,
+    )
     eval_criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
