@@ -134,3 +134,54 @@ Then open the local TensorBoard URL shown in terminal.
   - Check `DEVICE` in `config.py`.
 - Data loading issues
   - Verify `NEU-CLS-64` exists and has one subfolder per class.
+# SteelViT Defect Classification
+
+This project trains and evaluates a steel surface defect classifier on the `NEU-CLS-64` dataset.
+
+## What Kind of Model Is This?
+
+This is a **supervised multiclass image classification model** with a **hybrid CNN + Vision Transformer (ViT)** architecture.
+
+- Task: classify each image into 1 of 9 defect classes (`cr`, `gg`, `in`, `pa`, `ps`, `rp`, `rs`, `sc`, `sp`)
+- Input: grayscale image `[1, 64, 64]`
+- Output: class logits `[9]`
+- Learning setup: supervised learning from folder-based labels
+
+## Model Architecture (SteelViT)
+
+The model is implemented in `model.py` and follows this pipeline:
+
+1. **CNN stem** for local texture extraction  
+   `1x64x64 -> 32x64x64 -> 64x32x32 -> 128x16x16`
+2. **Patch embedding**  
+   `128x16x16 -> 192x8x8`, flattened into 64 tokens
+3. **Transformer encoder**  
+   6 encoder blocks, 3 attention heads, MLP ratio 4.0
+4. **Classification head**  
+   CLS token -> LayerNorm -> Linear -> 9 classes
+
+This is not a pure CNN and not a pure ViT. It combines CNN locality (good for defect texture) with Transformer global context modeling.
+
+## Training Details
+
+- Optimizer: AdamW
+- LR schedule: warmup + cosine decay
+- Regularization: label smoothing, MixUp, CutMix, stochastic depth
+- Precision: AMP on CUDA
+- Imbalance handling: class-weighted loss (configurable), optional weighted sampler
+
+## Run
+
+Train:
+
+```powershell
+uv run python train.py
+```
+
+Evaluate:
+
+```powershell
+uv run python evaluate.py
+```
+
+Plots and metrics are saved under `plots/`.
