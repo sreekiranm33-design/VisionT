@@ -1,258 +1,326 @@
-import random
+"""
+train.py  —  Training pipeline for LSAformer on NEU-CLS-64 (9 classes)
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
+Usage:
+    python train.py --data_root E:/VisionT/NEU-CLS-64 --epochs 100 --batch_size 64
+
+Directory structure expected:
+    NEU-CLS-64/
+        cr/  gg/  in/  pa/  ps/  rp/  rs/  sc/  sp/
+"""
+
+import argparse
+import os
+import json
+import time
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, f1_score
-from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import transforms, datasets
+from torchvision.transforms import RandAugment
 
-import config as cfg
-from dataset import create_dataloaders
-from model import SteelViT
-from utils import (
-    count_parameters,
-    cutmix_data,
-    get_cosine_schedule_with_warmup,
-    mixup_cutmix_criterion,
-    mixup_data,
-)
+from model import lsaformer_small, lsaformer_tiny, lsaformer_base
 
 
-def compute_class_weights(class_counts, power=1.0):
-    counts = np.array(class_counts, dtype=np.float64)
-    counts = np.maximum(counts, 1.0)
-    inv = np.power(1.0 / counts, power)
-    weights = inv / np.mean(inv)
-    return torch.tensor(weights, dtype=torch.float32)
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
+
+CLASS_NAMES = ['cr', 'gg', 'in', 'pa', 'ps', 'rp', 'rs', 'sc', 'sp']
+CLASS_COUNTS = [1209, 296, 774, 1148, 797, 200, 1589, 773, 438]  # from your dataset
 
 
-def set_random_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+# ─────────────────────────────────────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_transforms(train=True, image_size=64, in_channels=3):
+    if in_channels == 1:
+        mean, std = (0.5,), (0.5,)
+        to_gray = [transforms.Grayscale(num_output_channels=1)]
+    else:
+        mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+        to_gray = []
+
+    if train:
+        return transforms.Compose([
+            *to_gray,
+            transforms.Resize((image_size + 8, image_size + 8)),
+            transforms.RandomCrop(image_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(15),
+            RandAugment(num_ops=2, magnitude=9),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2) if in_channels == 3
+                else transforms.RandomGrayscale(p=0.0),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),
+        ])
+    else:
+        return transforms.Compose([
+            *to_gray,
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
 
 
-def resolve_device():
-    if cfg.DEVICE == "cuda" and torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+def build_dataloaders(data_root, batch_size=64, val_split=0.15, test_split=0.10,
+                      image_size=64, in_channels=3, num_workers=0):
+    """
+    Splits the flat per-class folders into train/val/test.
+    Uses WeightedRandomSampler to compensate for class imbalance.
+    """
+    import numpy as np
+    from torch.utils.data import Subset, random_split
 
-
-def evaluate(model, dataloader, criterion, device, use_amp):
-    model.eval()
-    total_loss = 0.0
-    all_targets = []
-    all_preds = []
-
-    with torch.no_grad():
-        for images, labels in dataloader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                logits = model(images)
-                loss = criterion(logits, labels)
-
-            total_loss += loss.item() * labels.size(0)
-            preds = logits.argmax(dim=1)
-            all_targets.extend(labels.cpu().tolist())
-            all_preds.extend(preds.cpu().tolist())
-
-    avg_loss = total_loss / len(dataloader.dataset)
-    acc = accuracy_score(all_targets, all_preds)
-    macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
-    return avg_loss, acc, macro_f1
-
-
-def main():
-    set_random_seed(cfg.RANDOM_SEED)
-    cfg.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    train_loader, val_loader, _, class_names, metadata = create_dataloaders(
-        return_metadata=True
-    )
-    device = resolve_device()
-    use_amp = cfg.AMP and device.type == "cuda"
-
-    model = SteelViT(num_classes=cfg.NUM_CLASSES).to(device)
-    count_parameters(model)
-
-    # Dataloader/model wiring sanity check required by the PRD.
-    sanity_images, _ = next(iter(train_loader))
-    sanity_images = sanity_images.to(device, non_blocking=True)
-    with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=use_amp):
-        sanity_logits = model(sanity_images[:2])
-    print(f"Sanity check output shape: {tuple(sanity_logits.shape)}")
-
-    class_weights = None
-    if cfg.USE_CLASS_WEIGHTED_LOSS:
-        class_weights = compute_class_weights(
-            metadata["train_class_counts"], power=cfg.CLASS_WEIGHT_POWER
-        ).to(device)
-        print(f"Train class counts: {metadata['train_class_counts']}")
-        print(f"Loss class weights: {[round(v, 4) for v in class_weights.tolist()]}")
-
-    train_criterion = nn.CrossEntropyLoss(
-        label_smoothing=cfg.LABEL_SMOOTHING,
-        weight=class_weights,
-    )
-    eval_criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.LR,
-        betas=cfg.BETAS,
-        weight_decay=cfg.WEIGHT_DECAY,
+    full_dataset = datasets.ImageFolder(
+        data_root,
+        transform=build_transforms(train=True, image_size=image_size, in_channels=in_channels)
     )
 
-    total_steps = cfg.NUM_EPOCHS * len(train_loader)
-    warmup_steps = cfg.WARMUP_EPOCHS * len(train_loader)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        warmup_epochs=warmup_steps,
-        total_epochs=total_steps,
-    )
+    n = len(full_dataset)
+    n_val  = int(n * val_split)
+    n_test = int(n * test_split)
+    n_train = n - n_val - n_test
 
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    writer = SummaryWriter(log_dir=str(cfg.LOG_DIR))
-    plots_dir = cfg.PROJECT_ROOT / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(42)
+    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test])
 
-    best_val_f1 = -1.0
-    global_step = 0
-    history = {
-        "epoch": [],
-        "train_loss": [],
-        "val_loss": [],
-        "val_acc": [],
-        "val_f1": [],
-        "lr": [],
-    }
+    # Overwrite transform for val/test (no augmentation)
+    val_ds.dataset  = datasets.ImageFolder(
+        data_root, transform=build_transforms(train=False, image_size=image_size, in_channels=in_channels))
+    test_ds.dataset = datasets.ImageFolder(
+        data_root, transform=build_transforms(train=False, image_size=image_size, in_channels=in_channels))
 
-    for epoch in range(1, cfg.NUM_EPOCHS + 1):
-        model.train()
-        running_loss = 0.0
+    # Weighted sampler for class balance
+    targets = [full_dataset.targets[i] for i in train_ds.indices]
+    counts  = torch.tensor(CLASS_COUNTS, dtype=torch.float)
+    weights = 1.0 / counts
+    sample_weights = torch.tensor([weights[t] for t in targets])
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
-        progress = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.NUM_EPOCHS}", leave=False)
-        for images, labels in progress:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+                              num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=True)
 
-            if random.random() < 0.5:
-                mixed_images, y_a, y_b, lam = mixup_data(images, labels, cfg.MIXUP_ALPHA)
-                aug_name = "mixup"
-            else:
-                mixed_images, y_a, y_b, lam = cutmix_data(images, labels, cfg.CUTMIX_ALPHA)
-                aug_name = "cutmix"
+    print(f"Dataset splits — Train: {n_train}, Val: {n_val}, Test: {n_test}")
+    print(f"Classes: {full_dataset.classes}")
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                logits = model(mixed_images)
-                loss = mixup_cutmix_criterion(train_criterion, logits, y_a, y_b, lam)
+    return train_loader, val_loader, test_loader, full_dataset.classes
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loss — Label Smoothing + Class Weights
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_criterion(device):
+    counts = torch.tensor(CLASS_COUNTS, dtype=torch.float)
+    weights = 1.0 / counts
+    weights = weights / weights.sum() * len(CLASS_COUNTS)
+    return nn.CrossEntropyLoss(weight=weights.to(device), label_smoothing=0.1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Train / Eval loops
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_epoch(model, loader, criterion, optimizer, device, scaler):
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
+
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast(enabled=scaler is not None):
+            logits = model(imgs)
+            loss   = criterion(logits, labels)
+
+        if scaler:
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-            running_loss += loss.item() * labels.size(0)
-            global_step += 1
+        total_loss += loss.item() * imgs.size(0)
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total   += imgs.size(0)
 
-            writer.add_scalar("train/loss_step", loss.item(), global_step)
-            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-            progress.set_postfix(loss=f"{loss.item():.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}", aug=aug_name)
-
-        train_loss = running_loss / len(train_loader.dataset)
-        writer.add_scalar("train/loss_epoch", train_loss, epoch)
-
-        val_loss, val_acc, val_f1 = evaluate(
-            model=model,
-            dataloader=val_loader,
-            criterion=eval_criterion,
-            device=device,
-            use_amp=use_amp,
-        )
-        writer.add_scalar("val/loss", val_loss, epoch)
-        writer.add_scalar("val/acc", val_acc, epoch)
-        writer.add_scalar("val/f1_macro", val_f1, epoch)
-        current_lr = optimizer.param_groups[0]["lr"]
-        history["epoch"].append(epoch)
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-        history["val_f1"].append(val_f1)
-        history["lr"].append(current_lr)
-
-        print(
-            f"Epoch {epoch:03d} | "
-            f"train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f} | "
-            f"val_acc={val_acc:.4f} | "
-            f"val_f1={val_f1:.4f}"
-        )
-
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "val_f1": val_f1,
-            "val_acc": val_acc,
-            "class_names": class_names,
-        }
-
-        if epoch % cfg.SAVE_EVERY == 0:
-            torch.save(checkpoint, cfg.CHECKPOINT_DIR / f"epoch_{epoch}.pth")
-
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            torch.save(checkpoint, cfg.CHECKPOINT_DIR / "best.pth")
-
-    writer.close()
-    history_df = pd.DataFrame(history)
-    history_csv = plots_dir / "training_history.csv"
-    history_df.to_csv(history_csv, index=False)
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(history_df["epoch"], history_df["train_loss"], label="train_loss")
-    plt.plot(history_df["epoch"], history_df["val_loss"], label="val_loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training vs Validation Loss")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(plots_dir / "loss_curve.png", dpi=200)
-    plt.close()
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(history_df["epoch"], history_df["val_acc"], label="val_acc")
-    plt.plot(history_df["epoch"], history_df["val_f1"], label="val_f1_macro")
-    plt.xlabel("Epoch")
-    plt.ylabel("Score")
-    plt.title("Validation Accuracy and Macro F1")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(plots_dir / "val_metrics_curve.png", dpi=200)
-    plt.close()
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(history_df["epoch"], history_df["lr"], label="lr")
-    plt.xlabel("Epoch")
-    plt.ylabel("Learning Rate")
-    plt.title("Learning Rate Schedule")
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(plots_dir / "lr_curve.png", dpi=200)
-    plt.close()
-
-    print(f"Saved training plots and history to: {plots_dir}")
-    print(f"Training complete. Best val_f1={best_val_f1:.4f}")
+    return total_loss / total, correct / total
 
 
-if __name__ == "__main__":
-    main()
+@torch.no_grad()
+def eval_epoch(model, loader, criterion, device):
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    all_preds, all_labels = [], []
+
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        logits = model(imgs)
+        loss   = criterion(logits, labels)
+
+        total_loss += loss.item() * imgs.size(0)
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total   += imgs.size(0)
+
+        all_preds.extend(preds.cpu().tolist())
+        all_labels.extend(labels.cpu().tolist())
+
+    return total_loss / total, correct / total, all_preds, all_labels
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-class accuracy
+# ─────────────────────────────────────────────────────────────────────────────
+
+def per_class_accuracy(preds, labels, class_names):
+    from collections import defaultdict
+    correct_per_class = defaultdict(int)
+    total_per_class   = defaultdict(int)
+
+    for p, l in zip(preds, labels):
+        total_per_class[l] += 1
+        if p == l:
+            correct_per_class[l] += 1
+
+    print("\nPer-class accuracy:")
+    for i, name in enumerate(class_names):
+        acc = correct_per_class[i] / max(total_per_class[i], 1) * 100
+        print(f"  {name:>4s}  ({total_per_class[i]:4d} samples): {acc:.1f}%")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Data
+    train_loader, val_loader, test_loader, class_names = build_dataloaders(
+        args.data_root, batch_size=args.batch_size,
+        image_size=args.image_size, in_channels=args.in_channels
+    )
+
+    # Model
+    model_fn = {'tiny': lsaformer_tiny, 'small': lsaformer_small, 'base': lsaformer_base}
+    model = model_fn[args.model_size](
+        num_classes=len(class_names),
+        image_size=args.image_size,
+        in_channels=args.in_channels
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model: LSAformer-{args.model_size} | Parameters: {n_params:,}")
+
+    # Loss, optimizer, scheduler
+    criterion = build_criterion(device)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=args.epochs // 3, T_mult=2)
+    scaler    = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+
+    # Output dir
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    best_val_acc = 0.0
+    history = []
+
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler)
+        val_loss,   val_acc, val_preds, val_labels = eval_epoch(model, val_loader, criterion, device)
+        scheduler.step()
+
+        elapsed = time.time() - t0
+        lr_now  = optimizer.param_groups[0]['lr']
+
+        print(f"Epoch {epoch:3d}/{args.epochs} | "
+              f"Train loss {train_loss:.4f} acc {train_acc*100:.2f}% | "
+              f"Val loss {val_loss:.4f} acc {val_acc*100:.2f}% | "
+              f"LR {lr_now:.6f} | {elapsed:.1f}s")
+
+        history.append({
+            'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc,
+            'val_loss': val_loss, 'val_acc': val_acc
+        })
+
+        # Save best
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'class_names': class_names,
+            }, out_dir / 'best_model.pth')
+            print(f"  ✓ Saved best model (val_acc={val_acc*100:.2f}%)")
+
+        # Periodic checkpoint
+        if epoch % 10 == 0:
+            torch.save(model.state_dict(), out_dir / f'checkpoint_epoch{epoch}.pth')
+
+    # ── Final test evaluation ─────────────────────────────────────────────────
+    print("\n─── Loading best model for final test evaluation ───")
+    ckpt = torch.load(out_dir / 'best_model.pth', map_location=device)
+    model.load_state_dict(ckpt['model_state_dict'])
+
+    test_loss, test_acc, test_preds, test_labels = eval_epoch(model, test_loader, criterion, device)
+    print(f"\nTest accuracy: {test_acc*100:.2f}%  |  Test loss: {test_loss:.4f}")
+    per_class_accuracy(test_preds, test_labels, class_names)
+
+    # Save history
+    with open(out_dir / 'training_history.json', 'w') as f:
+        json.dump(history, f, indent=2)
+
+    print(f"\nBest validation accuracy: {best_val_acc*100:.2f}%")
+    print(f"Outputs saved to: {out_dir}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train LSAformer on NEU-CLS-64')
+
+    # Data
+    parser.add_argument('--data_root',   type=str, default='E:/VisionT/NEU-CLS-64')
+    parser.add_argument('--image_size',  type=int, default=64)
+    parser.add_argument('--in_channels', type=int, default=3,
+                        help='1=grayscale, 3=RGB (NEU-CLS images are grayscale-like; try 1)')
+
+    # Model
+    parser.add_argument('--model_size',  type=str, default='small',
+                        choices=['tiny', 'small', 'base'])
+
+    # Training
+    parser.add_argument('--epochs',        type=int,   default=100)
+    parser.add_argument('--batch_size',    type=int,   default=64)
+    parser.add_argument('--lr',            type=float, default=3e-4)
+    parser.add_argument('--weight_decay',  type=float, default=1e-2)
+
+    # Output
+    parser.add_argument('--output_dir', type=str, default='./checkpoints')
+
+    args = parser.parse_args()
+    main(args)
